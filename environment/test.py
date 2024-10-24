@@ -1,7 +1,8 @@
 import pygame
 import numpy as np
-import random
 from enum import Enum
+import math
+import random
 
 # Initialize Pygame
 pygame.init()
@@ -12,243 +13,285 @@ BLACK = (0, 0, 0)
 GRAY = (128, 128, 128)
 RED = (255, 0, 0)
 GREEN = (0, 255, 0)
-YELLOW = (255, 255, 0)
 BLUE = (0, 0, 255)
+YELLOW = (255, 255, 0)
+DARK_GRAY = (64, 64, 64)
 
-class Direction(Enum):
-    NORTH = 0
-    EAST = 1
-    SOUTH = 2
-    WEST = 3
+class GameState(Enum):
+    PLACING_BUILDING = 1
+    DRAWING_ROAD = 2
+    PLACING_TRAFFIC_LIGHT = 3
+    SIMULATING = 4
 
-class Vehicle:
-    def __init__(self, position, direction):
-        self.position = list(position)  # [x, y] for easier updating
-        self.direction = direction
-        self.waiting_time = 0
-        self.has_crossed = False
-        self.speed = 2  # pixels per frame
-        self.size = 20  # size of vehicle in pixels
-        
+class BuildingType(Enum):
+    SOURCE = 1  # Buildings that generate cars
+    DESTINATION = 2  # Buildings that receive cars
+
+class Button:
+    def __init__(self, x, y, width, height, text, color):
+        self.rect = pygame.Rect(x, y, width, height)
+        self.color = color
+        self.text = text
+        self.font = pygame.font.Font(None, 30)
+        self.active = False
+
     def draw(self, screen):
-        color = BLUE if self.waiting_time == 0 else YELLOW
-        pygame.draw.rect(screen, color, 
-                        (self.position[0] - self.size//2,
-                         self.position[1] - self.size//2,
-                         self.size, self.size))
+        color = (*self.color, 200) if self.active else (*self.color, 255)
+        pygame.draw.rect(screen, color, self.rect)
+        pygame.draw.rect(screen, BLACK, self.rect, 2)
+        
+        text_surface = self.font.render(self.text, True, BLACK)
+        text_rect = text_surface.get_rect(center=self.rect.center)
+        screen.blit(text_surface, text_rect)
 
-class TrafficLight:
-    def __init__(self, position):
+    def is_clicked(self, pos):
+        return self.rect.collidepoint(pos)
+
+class Building:
+    def __init__(self, position, building_type, spawn_rate=1.0):
         self.position = position
-        self.is_green = False
-        self.timer = 0
-        self.cycle_duration = 150  # frames
-        self.size = 20
-        
-    def draw(self, screen):
-        color = GREEN if self.is_green else RED
-        pygame.draw.circle(screen, color, 
-                         (self.position[0], self.position[1]), 
-                         self.size//2)
+        self.type = building_type
+        self.spawn_rate = spawn_rate
+        self.spawn_timer = 0
+        self.size = 40
+        self.connections = []  # Road points connected to this building
+        self.rect = pygame.Rect(position[0] - self.size//2,
+                              position[1] - self.size//2,
+                              self.size, self.size)
     
-    def update(self):
-        self.timer += 1
-        if self.timer >= self.cycle_duration:
-            self.is_green = not self.is_green
-            self.timer = 0
+    def draw(self, screen):
+        color = BLUE if self.type == BuildingType.SOURCE else GREEN
+        pygame.draw.rect(screen, color, self.rect)
+        # Draw highlight if building has connections
+        if self.connections:
+            pygame.draw.rect(screen, YELLOW, self.rect, 2)
 
-class TrafficEnvironment:
-    def __init__(self, width=800, height=600, traffic_density='medium'):
+    def is_clicked(self, pos):
+        return self.rect.collidepoint(pos)
+
+class Road:
+    def __init__(self):
+        self.points = []
+        self.width = 20
+        self.connected_buildings = []  # Keep track of connected buildings
+    
+    def add_point(self, point):
+        self.points.append(point)
+    
+    def draw(self, screen):
+        if len(self.points) < 2:
+            return
+        
+        # Draw road segments
+        for i in range(len(self.points) - 1):
+            start = self.points[i]
+            end = self.points[i + 1]
+            pygame.draw.line(screen, GRAY, start, end, self.width)
+            
+        # Draw connection points
+        for point in self.points:
+            pygame.draw.circle(screen, DARK_GRAY, point, 5)
+            
+        # Highlight end points if connected to buildings
+        for building in self.connected_buildings:
+            closest_point = self.get_closest_point(building.position)
+            pygame.draw.circle(screen, YELLOW, closest_point, 8)
+
+    def get_closest_point(self, position):
+        closest_point = None
+        min_distance = float('inf')
+        
+        for point in self.points:
+            dist = math.hypot(point[0] - position[0], point[1] - position[1])
+            if dist < min_distance:
+                min_distance = dist
+                closest_point = point
+                
+        return closest_point
+
+class TrafficSimulation:
+    def __init__(self, width=1200, height=800):
         self.width = width
         self.height = height
         self.screen = pygame.display.set_mode((width, height))
-        pygame.display.set_caption("Traffic Simulation")
+        pygame.display.set_caption("Traffic Simulation Designer")
         
         self.clock = pygame.time.Clock()
         self.running = True
         
-        # Road properties
-        self.road_width = 60
-        self.vehicles = []
-        self.traffic_density = traffic_density
+        # Game objects
+        self.buildings = []
+        self.roads = []
+        self.traffic_lights = []
+        self.cars = []
         
-        # Calculate center lines of roads
-        self.vertical_center = width // 2
-        self.horizontal_center = height // 2
+        # Game state
+        self.state = GameState.PLACING_BUILDING
+        self.current_road = None
+        self.selected_building_type = BuildingType.SOURCE
+        self.spawn_rate = 1.0
+        self.selected_building = None  # For road connections
         
-        # Initialize traffic lights
-        self.traffic_lights = {
-            'north': TrafficLight((self.vertical_center, self.horizontal_center - self.road_width//2)),
-            'south': TrafficLight((self.vertical_center, self.horizontal_center + self.road_width//2)),
-            'east': TrafficLight((self.vertical_center + self.road_width//2, self.horizontal_center)),
-            'west': TrafficLight((self.vertical_center - self.road_width//2, self.horizontal_center))
+        # Create buttons
+        button_y = 10
+        button_height = 40
+        self.buttons = {
+            'source': Button(10, button_y, 150, button_height, "Source Building", (100, 200, 255)),
+            'destination': Button(170, button_y, 150, button_height, "Destination", (100, 255, 100)),
+            'road': Button(330, button_y, 150, button_height, "Draw Road", (200, 200, 200)),
+            'traffic_light': Button(490, button_y, 150, button_height, "Traffic Light", (255, 200, 100)),
+            'simulate': Button(650, button_y, 150, button_height, "Simulate", (255, 100, 100))
         }
+        self.buttons['source'].active = True
         
-        # Set opposite traffic lights to same state
-        self.traffic_lights['north'].is_green = True
-        self.traffic_lights['south'].is_green = True
-        self.traffic_lights['east'].is_green = False
-        self.traffic_lights['west'].is_green = False
-        
-    def add_vehicle(self):
-        """Add vehicles based on traffic density"""
-        if self.traffic_density == 'low':
-            spawn_probability = 0.02
-        elif self.traffic_density == 'medium':
-            spawn_probability = 0.04
-        else:  # high
-            spawn_probability = 0.08
+    def set_state(self, new_state):
+        self.state = new_state
+        # Reset all buttons
+        for button in self.buttons.values():
+            button.active = False
             
-        if random.random() < spawn_probability:
-            # Define spawn points and directions
-            spawn_points = [
-                ((self.vertical_center, self.height), Direction.NORTH),
-                ((self.vertical_center, 0), Direction.SOUTH),
-                ((0, self.horizontal_center), Direction.EAST),
-                ((self.width, self.horizontal_center), Direction.WEST)
-            ]
-            
-            position, direction = random.choice(spawn_points)
-            self.vehicles.append(Vehicle(position, direction))
-    
-    def update_vehicles(self):
-        """Update vehicle positions"""
-        for vehicle in list(self.vehicles):
-            if vehicle.has_crossed:
-                self.vehicles.remove(vehicle)
-                continue
-                
-            x, y = vehicle.position
-            
-            # Check if at intersection
-            at_intersection = (
-                abs(x - self.vertical_center) < 30 and
-                abs(y - self.horizontal_center) < 30
-            )
-            
-            can_move = True
-            if at_intersection:
-                # Check traffic light
-                if vehicle.direction in [Direction.NORTH, Direction.SOUTH]:
-                    can_move = self.traffic_lights['north'].is_green
-                else:
-                    can_move = self.traffic_lights['east'].is_green
-                
-                if not can_move:
-                    vehicle.waiting_time += 1
-            
-            # Check for vehicles ahead
-            for other in self.vehicles:
-                if other != vehicle and not other.has_crossed:
-                    if self._vehicles_too_close(vehicle, other):
-                        can_move = False
-                        vehicle.waiting_time += 1
-                        break
-            
-            if can_move:
-                # Update position based on direction
-                if vehicle.direction == Direction.NORTH:
-                    vehicle.position[1] -= vehicle.speed
-                elif vehicle.direction == Direction.SOUTH:
-                    vehicle.position[1] += vehicle.speed
-                elif vehicle.direction == Direction.EAST:
-                    vehicle.position[0] += vehicle.speed
-                else:  # WEST
-                    vehicle.position[0] -= vehicle.speed
-                
-                # Check if vehicle has left the screen
-                if (vehicle.position[0] < 0 or vehicle.position[0] > self.width or
-                    vehicle.position[1] < 0 or vehicle.position[1] > self.height):
-                    vehicle.has_crossed = True
-    
-    def _vehicles_too_close(self, v1, v2):
-        """Check if two vehicles are too close"""
-        min_distance = 30  # minimum safe distance
-        x1, y1 = v1.position
-        x2, y2 = v2.position
-        
-        if v1.direction == v2.direction:
-            if v1.direction in [Direction.NORTH, Direction.SOUTH]:
-                return abs(x1 - x2) < v1.size and abs(y1 - y2) < min_distance
+        # Activate appropriate button
+        if new_state == GameState.PLACING_BUILDING:
+            if self.selected_building_type == BuildingType.SOURCE:
+                self.buttons['source'].active = True
             else:
-                return abs(y1 - y2) < v1.size and abs(x1 - x2) < min_distance
-        return False
+                self.buttons['destination'].active = True
+        elif new_state == GameState.DRAWING_ROAD:
+            self.buttons['road'].active = True
+        elif new_state == GameState.PLACING_TRAFFIC_LIGHT:
+            self.buttons['traffic_light'].active = True
+        elif new_state == GameState.SIMULATING:
+            self.buttons['simulate'].active = True
+
+    def handle_events(self):
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                self.running = False
+            
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                mouse_pos = pygame.mouse.get_pos()
+                
+                # Check button clicks first
+                button_clicked = False
+                for name, button in self.buttons.items():
+                    if button.is_clicked(mouse_pos):
+                        button_clicked = True
+                        if name == 'source':
+                            self.selected_building_type = BuildingType.SOURCE
+                            self.set_state(GameState.PLACING_BUILDING)
+                        elif name == 'destination':
+                            self.selected_building_type = BuildingType.DESTINATION
+                            self.set_state(GameState.PLACING_BUILDING)
+                        elif name == 'road':
+                            self.set_state(GameState.DRAWING_ROAD)
+                            self.current_road = None
+                        elif name == 'traffic_light':
+                            self.set_state(GameState.PLACING_TRAFFIC_LIGHT)
+                        elif name == 'simulate':
+                            self.set_state(GameState.SIMULATING)
+                
+                if button_clicked:
+                    continue
+                
+                # Handle game state actions
+                if self.state == GameState.PLACING_BUILDING:
+                    if mouse_pos[1] > 60:  # Don't place buildings over UI
+                        self.buildings.append(Building(mouse_pos, 
+                                                    self.selected_building_type,
+                                                    self.spawn_rate))
+                
+                elif self.state == GameState.DRAWING_ROAD:
+                    # Check if clicked on a building
+                    clicked_building = None
+                    for building in self.buildings:
+                        if building.is_clicked(mouse_pos):
+                            clicked_building = building
+                            break
+                    
+                    if clicked_building:
+                        if not self.current_road:
+                            # Start new road from building
+                            self.current_road = Road()
+                            self.roads.append(self.current_road)
+                            self.current_road.add_point(clicked_building.position)
+                            self.current_road.connected_buildings.append(clicked_building)
+                            clicked_building.connections.append(self.current_road)
+                        else:
+                            # End road at building
+                            self.current_road.add_point(clicked_building.position)
+                            self.current_road.connected_buildings.append(clicked_building)
+                            clicked_building.connections.append(self.current_road)
+                            self.current_road = None
+                    else:
+                        # Add road point if not clicking building
+                        if self.current_road:
+                            self.current_road.add_point(mouse_pos)
+                
+                elif self.state == GameState.PLACING_TRAFFIC_LIGHT:
+                    self.traffic_lights.append(TrafficLight(mouse_pos))
+            
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    self.current_road = None
+                elif event.key == pygame.K_UP:
+                    self.spawn_rate += 0.1
+                elif event.key == pygame.K_DOWN:
+                    self.spawn_rate = max(0.1, self.spawn_rate - 0.1)
     
     def draw(self):
-        """Draw the environment"""
         # Fill background
         self.screen.fill(WHITE)
         
         # Draw roads
-        pygame.draw.rect(self.screen, GRAY, 
-                        (self.vertical_center - self.road_width//2, 0,
-                         self.road_width, self.height))
-        pygame.draw.rect(self.screen, GRAY,
-                        (0, self.horizontal_center - self.road_width//2,
-                         self.width, self.road_width))
+        for road in self.roads:
+            road.draw(self.screen)
         
-        # Draw road lines
-        line_color = (255, 255, 0)  # Yellow
-        # Vertical road lines
-        pygame.draw.line(self.screen, line_color,
-                        (self.vertical_center, 0),
-                        (self.vertical_center, self.height), 2)
-        # Horizontal road lines
-        pygame.draw.line(self.screen, line_color,
-                        (0, self.horizontal_center),
-                        (self.width, self.horizontal_center), 2)
+        # Draw current road being placed
+        if self.current_road:
+            self.current_road.draw(self.screen)
+            # Draw line from last point to mouse
+            if self.current_road.points:
+                mouse_pos = pygame.mouse.get_pos()
+                pygame.draw.line(self.screen, GRAY, 
+                               self.current_road.points[-1], 
+                               mouse_pos, 
+                               self.current_road.width)
+        
+        # Draw buildings
+        for building in self.buildings:
+            building.draw(self.screen)
         
         # Draw traffic lights
-        for light in self.traffic_lights.values():
+        for light in self.traffic_lights:
             light.draw(self.screen)
         
-        # Draw vehicles
-        for vehicle in self.vehicles:
-            vehicle.draw(self.screen)
+        # Draw cars
+        for car in self.cars:
+            car.draw(self.screen)
         
-        # Update display
+        # Draw UI
+        for button in self.buttons.values():
+            button.draw(self.screen)
+        
+        # Draw spawn rate
+        font = pygame.font.Font(None, 36)
+        spawn_text = f"Spawn Rate: {self.spawn_rate:.1f}"
+        spawn_surface = font.render(spawn_text, True, BLACK)
+        self.screen.blit(spawn_surface, (810, 20))
+        
         pygame.display.flip()
     
     def run(self):
-        """Main game loop"""
         while self.running:
-            # Event handling
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    self.running = False
-                elif event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_1:
-                        self.traffic_density = 'low'
-                    elif event.key == pygame.K_2:
-                        self.traffic_density = 'medium'
-                    elif event.key == pygame.K_3:
-                        self.traffic_density = 'high'
-            
-            # Update traffic lights
-            for light in self.traffic_lights.values():
-                light.update()
-            
-            # Ensure opposite traffic lights are synchronized
-            self.traffic_lights['south'].is_green = self.traffic_lights['north'].is_green
-            self.traffic_lights['west'].is_green = self.traffic_lights['east'].is_green
-            
-            # Add new vehicles
-            self.add_vehicle()
-            
-            # Update vehicle positions
-            self.update_vehicles()
-            
-            # Draw everything
+            self.handle_events()
             self.draw()
-            
-            # Control frame rate
             self.clock.tick(60)
         
         pygame.quit()
 
 def main():
-    env = TrafficEnvironment(traffic_density='medium')
-    env.run()
+    sim = TrafficSimulation()
+    sim.run()
 
 if __name__ == "__main__":
     main()
